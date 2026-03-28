@@ -1,0 +1,131 @@
+From: msedek <msedek@users.noreply.github.com>
+Date: Sat, 28 Mar 2026
+Subject: [PATCH 2/2] backends/drm: force modeset on HDMI hotplug for link
+ re-training
+
+When an HDMI connector receives a hotplug "change" event but its status
+remains "connected" (common with force-enabled connectors or TVs that
+switch inputs without electrically disconnecting), the HDMI link may
+have degraded. The sink (TV) may have stopped listening to TMDS signals
+and needs link re-training when it returns to the HDMI input.
+
+Currently, KWin only forces a modeset when link-status is explicitly
+reported as "Bad" by the kernel driver. However, many drivers (notably
+NVIDIA) do not set link-status to Bad in this scenario — they report
+the forced status and move on.
+
+This patch adds two mechanisms:
+1. DrmConnector::isHdmi() accessor to identify HDMI connector types
+2. In DrmGpu::updateOutputs(), when a connected HDMI connector already
+   has an active output, set m_forceModeset to trigger link re-training
+   via the existing modeset pipeline.
+
+This is gated behind a new parameter to updateOutputs() that tracks
+whether the call originated from a hotplug event, preventing unnecessary
+modesets during initial scan or session resume.
+
+The modeset to the same mode is safe — it only re-trains the TMDS link
+and re-negotiates HDCP, with at most a brief blanking period.
+
+BUG: https://bugs.kde.org/show_bug.cgi?id=XXXXX
+Signed-off-by: msedek <msedek@users.noreply.github.com>
+---
+ src/backends/drm/drm_backend.cpp   |  6 ++++--
+ src/backends/drm/drm_connector.cpp |  7 +++++++
+ src/backends/drm/drm_connector.h   |  1 +
+ src/backends/drm/drm_gpu.cpp       | 18 +++++++++++++++++-
+ src/backends/drm/drm_gpu.h         |  2 +-
+ 5 files changed, 30 insertions(+), 4 deletions(-)
+
+diff --git a/src/backends/drm/drm_connector.h b/src/backends/drm/drm_connector.h
+index XXXXXXX..YYYYYYY 100644
+--- a/src/backends/drm/drm_connector.h
++++ b/src/backends/drm/drm_connector.h
+@@ -63,6 +63,7 @@ public:
+     bool isConnected() const;
+     bool isNonDesktop() const;
+     bool isInternal() const;
++    bool isHdmi() const;
+
+     const Edid *edid() const;
+     QString connectorName() const;
+diff --git a/src/backends/drm/drm_connector.cpp b/src/backends/drm/drm_connector.cpp
+index XXXXXXX..YYYYYYY 100644
+--- a/src/backends/drm/drm_connector.cpp
++++ b/src/backends/drm/drm_connector.cpp
+@@ -181,6 +181,13 @@ bool DrmConnector::isConnected() const
+     return !m_driverModes.empty() && m_conn && m_conn->connection == DRM_MODE_CONNECTED;
+ }
+
++bool DrmConnector::isHdmi() const
++{
++    return m_conn &&
++           (m_conn->connector_type == DRM_MODE_CONNECTOR_HDMIA ||
++            m_conn->connector_type == DRM_MODE_CONNECTOR_HDMIB);
++}
++
+ QString DrmConnector::connectorName() const
+ {
+     const char *connectorName = drmModeGetConnectorTypeName(m_conn->connector_type);
+diff --git a/src/backends/drm/drm_gpu.h b/src/backends/drm/drm_gpu.h
+index XXXXXXX..YYYYYYY 100644
+--- a/src/backends/drm/drm_gpu.h
++++ b/src/backends/drm/drm_gpu.h
+@@ -113,7 +113,7 @@ public:
+
+     void setEglDisplay(std::unique_ptr<EglDisplay> &&display);
+
+-    bool updateOutputs();
++    bool updateOutputs(bool fromHotplug = false);
+     void removeOutputs();
+
+     DrmPipeline::Error testPendingConfiguration();
+diff --git a/src/backends/drm/drm_gpu.cpp b/src/backends/drm/drm_gpu.cpp
+index XXXXXXX..YYYYYYY 100644
+--- a/src/backends/drm/drm_gpu.cpp
++++ b/src/backends/drm/drm_gpu.cpp
+@@ -249,7 +249,7 @@ void DrmGpu::initDrmResources()
+     }
+ }
+
+-bool DrmGpu::updateOutputs()
++bool DrmGpu::updateOutputs(bool fromHotplug)
+ {
+     if (!m_isActive) {
+         return false;
+@@ -336,6 +336,22 @@ bool DrmGpu::updateOutputs()
+             }
++            /*
++             * When a hotplug event arrives for an HDMI connector that is
++             * still connected with an active output, force a modeset to
++             * re-train the TMDS link. This handles the case where a TV
++             * switches to built-in apps (Netflix, etc.) and stops
++             * listening on its HDMI receiver. When the TV returns to the
++             * HDMI input, the GPU needs to re-negotiate the link even
++             * though the connector status never changed.
++             */
++            if (fromHotplug && conn->isConnected() && conn->isHdmi() && findOutput(conn->id())) {
++                if (!m_forceModeset) {
++                    qCDebug(KWIN_DRM, "HDMI hotplug on connected connector %s, "
++                            "forcing modeset for link re-training",
++                            qPrintable(conn->connectorName()));
++                    m_forceModeset = true;
++                }
++            }
+             it++;
+         } else {
+diff --git a/src/backends/drm/drm_backend.cpp b/src/backends/drm/drm_backend.cpp
+index XXXXXXX..YYYYYYY 100644
+--- a/src/backends/drm/drm_backend.cpp
++++ b/src/backends/drm/drm_backend.cpp
+@@ -218,7 +218,9 @@ void DrmBackend::handleUdevEvent()
+             if (gpu && gpu->isActive()) {
+                 qCDebug(KWIN_DRM) << "Received change event for monitored drm device" << gpu->drmDevice()->path();
+-                updateOutputs();
++                for (auto it = m_gpus.begin(); it != m_gpus.end(); ++it) {
++                    (*it)->updateOutputs(true);
++                }
++                Q_EMIT outputsQueried();
+             }
+         }
+     }

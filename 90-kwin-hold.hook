@@ -1,0 +1,9 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = kwin
+
+[Action]
+Description = Blocking kwin upgrade (patched locally for HDMI link re-training)
+When = PreTransaction
+Exec = /bin/bash -c 'echo "ERROR: kwin is patched locally for HDMI link re-training." && echo "See /home/msedek/linux/patches/README.md" && echo "To force update: sudo pacman -S kwin --overwrite \"*\" then rebuild patch." && exit 1'

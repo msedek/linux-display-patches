@@ -1,0 +1,15 @@
+[Unit]
+Description=HDMI Watchdog - auto re-toggle Samsung TV handshake
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/msedek/.local/bin/hdmi-watchdog.sh
+Restart=always
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=default.target
