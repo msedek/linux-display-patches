@@ -1,35 +1,53 @@
-From: msedek <msedek@users.noreply.github.com>
+From: Miguel Sedek <miguelsedek@gmail.com>
 Date: Sat, 28 Mar 2026
-Subject: [PATCH 1/2] drm/probe_helper: signal hotplug for force-enabled connectors on HPD
+Subject: [PATCH] drm/probe-helper: signal hotplug for force-enabled
+ connectors on HPD
 
-When a connector has force == DRM_FORCE_ON (set via video=CONNECTOR:e),
-check_connector_changed() calls the driver's detect() callback, which
-for well-behaved drivers returns connector_status_connected regardless
-of actual hardware state. This means the epoch counter never increments
-and no uevent is sent to userspace.
+When a connector has DRM_FORCE_ON (set via video=CONNECTOR:e),
+check_connector_changed() calls the driver's detect() callback.
+Well-behaved drivers (e.g. NVIDIA's open kernel module) check
+connector->force and return connector_status_connected regardless
+of actual hardware state. This means the epoch counter never
+increments and no uevent reaches userspace.
 
-However, the HPD interrupt itself indicates a physical state change on
-the link (e.g., a TV switching inputs). Even though the logical status
-stays "connected", the HDMI/DP link may need re-training. Userspace
-compositors (KWin, Mutter, etc.) need to be notified so they can
-trigger a modeset to re-negotiate the link.
+However, the HPD interrupt itself indicates a physical state
+change on the link. A common scenario is an HDMI-connected TV
+switching to built-in apps (Netflix, etc.), which causes the TV's
+HDMI receiver to stop listening to TMDS signals. When the TV
+returns to the HDMI input, the GPU needs to re-negotiate the link,
+but no component in the stack detects this because the forced
+status masks the physical change.
 
-This patch adds a force check to check_connector_changed(): when a
-force-enabled connector receives an HPD event, we increment the epoch
-counter and return true to ensure the hotplug uevent reaches userspace.
+Add an epoch counter increment for force-enabled connectors after
+detect() returns. This ensures the hotplug uevent reaches
+userspace compositors so they can trigger a modeset for link
+re-training.
 
-Note: The software polling path (output_poll_execute) already skips
-force-enabled connectors. This patch addresses only the hardware HPD
-IRQ path, which was previously unguarded.
+Note that detect() is still called normally before the epoch
+bump. This preserves driver-side effects like scrambler
+re-initialization on vc4/i915. This approach differs from a
+prior patch by Michael Rodin (2022-08-26) which skipped detect()
+entirely for forced connectors and was rejected due to
+regression concerns raised by Maxime Ripard.
 
-Bug: https://gitlab.freedesktop.org/drm/misc/-/issues/XXXX
-Signed-off-by: msedek <msedek@users.noreply.github.com>
+The software polling path (output_poll_execute) already skips
+forced connectors with an explicit guard. This patch addresses
+only the hardware HPD IRQ path, which was previously unguarded.
+
+Tested with:
+- GPU: NVIDIA RTX 5070 Ti (nvidia-open 595.58.03)
+- Display: Samsung 75" 4K TV via HDMI-A-1 (force-enabled)
+- Kernel: 6.19.10 (CachyOS)
+- Compositor: KWin 6.6.3 (Wayland)
+- Scenario: TV switches to built-in apps, returns to HDMI input,
+  display recovers after compositor receives uevent and modesets.
+
+Signed-off-by: Miguel Sedek <miguelsedek@gmail.com>
 ---
  drivers/gpu/drm/drm_probe_helper.c | 15 +++++++++++++++
  1 file changed, 15 insertions(+)
 
 diff --git a/drivers/gpu/drm/drm_probe_helper.c b/drivers/gpu/drm/drm_probe_helper.c
-index XXXXXXX..YYYYYYY 100644
 --- a/drivers/gpu/drm/drm_probe_helper.c
 +++ b/drivers/gpu/drm/drm_probe_helper.c
 @@ -984,6 +984,21 @@ static bool check_connector_changed(struct drm_connector *connector)
@@ -39,14 +57,16 @@ index XXXXXXX..YYYYYYY 100644
 +	/*
 +	 * For force-enabled connectors, the driver's detect() returns the
 +	 * forced status, so the epoch counter never increments. But an HPD
-+	 * event on a forced connector still indicates a physical link change
-+	 * (e.g., a TV switching inputs). Notify userspace so the compositor
-+	 * can trigger a modeset to re-train the link.
++	 * event on a forced connector still indicates a physical link state
++	 * change (e.g. a TV switching inputs). Signal the change to
++	 * userspace so the compositor can trigger a modeset for link
++	 * re-training. Note: detect() is still called above so driver-side
++	 * effects (scrambler re-init, etc.) are preserved.
 +	 */
 +	if (connector->force && old_epoch_counter == connector->epoch_counter) {
 +		connector->epoch_counter += 1;
 +		drm_dbg_kms(dev,
-+			    "[CONNECTOR:%d:%s] HPD on force-enabled connector, signaling change for link re-training\n",
++			    "[CONNECTOR:%d:%s] HPD on force-enabled connector, signaling link re-train\n",
 +			    connector->base.id, connector->name);
 +		return true;
 +	}
